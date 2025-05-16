@@ -1,0 +1,221 @@
+name: Test Workflow migration
+
+on:
+  push:
+    branches:
+      - CAT-789-migrate-workflow-tests
+
+jobs:
+  build_and_test:
+    name: Install, Build, and Test Workflows
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Environment and Build Project
+        uses: ./.github/actions/setup-and-build
+        with:
+          node-version: '22.x'
+          cache-suffix: 'workflow-test'
+
+      - name: Install OS dependencies
+        run: |
+          sudo apt update -y
+          echo 'tzdata tzdata/Areas select Europe' | sudo debconf-set-selections
+          echo 'tzdata tzdata/Zones/Europe select Paris' | sudo debconf-set-selections
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends graphicsmagick
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Import credentials
+        run: ./packages/cli/bin/n8n import:credentials --input=test-workflows/credentials.json
+        env:
+          N8N_ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+
+      - name: Import workflows
+        run: ./packages/cli/bin/n8n import:workflow --separate --input=test-workflows/workflows
+        env:
+          N8N_ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+
+      - name: Copy static assets
+        run: |
+          mkdir -p /tmp/testData/pdfs # Ensure target directory exists
+          cp assets/n8n-logo.png /tmp/n8n-logo.png
+          cp assets/n8n-screenshot.png /tmp/n8n-screenshot.png
+          cp test-workflows/testData/pdfs/*.pdf /tmp/testData/pdfs/
+
+      - name: Run tests
+        id: tests
+        run: ./packages/cli/bin/n8n executeBatch --shallow --skipList=test-workflows/skipList.json --githubWorkflow --shortOutput --output=test-results.json --concurrency=16 --compare=test-workflows/snapshots
+        continue-on-error: true
+        env:
+          N8N_ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          SKIP_STATISTICS_EVENTS: "true"
+          DB_SQLITE_POOL_SIZE: "4"
+          N8N_SENTRY_DSN: ${{ secrets.CI_SENTRY_DSN }}
+
+
+      - name: Report test outcome
+        if: always() # Ensures this step runs regardless of previous outcomes
+        run: |
+          echo "Test step outcome was: ${{ steps.tests.outcome }}"
+          if [[ "${{ steps.tests.outcome }}" == "failure" ]]; then
+            echo "Workflow tests failed but the workflow will continue."
+            # Add any specific notification logic here if desired
+          elif [[ "${{ steps.tests.outcome }}" == "success" ]]; then
+            echo "Workflow tests passed."
+          else
+            echo "Workflow tests outcome: ${{ steps.tests.outcome }}"
+          fi
+
+      - name: Prepare and Send Test Results to Webhook
+        # This condition ensures:
+        # 1. The feature is explicitly enabled via the input.
+        # 2. The webhook URL secret is provided.
+        # 3. The 'tests' step has run (meaning test-results.json should ideally exist).
+        shell: bash
+        env:
+          WEBHOOK_URL: https://internal.users.n8n.cloud/webhook/78befc49-c4a9-457d-a8ae-50a85bd88093
+          TEST_RESULTS_FILE: ./test-results.json
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_SHA: ${{ github.sha }}
+          GH_REF: ${{ github.ref }}
+          GH_EVENT_NAME: ${{ github.event_name }}
+          # For PR number, try to get it from PR event or issue_comment event (if triggered by PR comment)
+          GH_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          GH_WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_ACTOR: ${{ github.actor }}
+
+        run: |
+          echo "Attempting to send test results to webhook..."
+          echo "Test results file expected at: $TEST_RESULTS_FILE"
+
+          if [ ! -f "$TEST_RESULTS_FILE" ]; then
+            echo "::warning::Test results file ($TEST_RESULTS_FILE) not found. Skipping webhook."
+            exit 0 # Exit successfully as this step is optional or file wasn't generated
+          fi
+
+          # Ensure jq is available
+          if ! command -v jq &> /dev/null; then
+            echo "jq not found. Installing jq..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq
+            if ! command -v jq &> /dev/null; then
+              echo "::error::Failed to install jq. Cannot process JSON."
+              exit 1
+            fi
+          fi
+
+          pr_number_to_send=""
+          if [ -n "$GH_PR_NUMBER" ]; then
+            pr_number_to_send=$GH_PR_NUMBER
+          fi
+
+          echo "Preparing JSON payload..."
+
+          # Check if the test results file is empty
+          if [ ! -s "$TEST_RESULTS_FILE" ]; then
+            echo "::warning::Test results file ($TEST_RESULTS_FILE) is empty. Sending only GitHub context."
+            # Create JSON with only the GitHub context if the results file is empty
+            enriched_payload=$(jq -n \
+              --arg repository "$GH_REPOSITORY" \
+              --arg run_id "$GH_RUN_ID" \
+              --arg run_attempt "$GH_RUN_ATTEMPT" \
+              --arg sha "$GH_SHA" \
+              --arg ref "$GH_REF" \
+              --arg event_name "$GH_EVENT_NAME" \
+              --arg pr_num "$pr_number_to_send" \
+              --arg workflow_run_url "$GH_WORKFLOW_RUN_URL" \
+              --arg actor "$GH_ACTOR" \
+              '{
+                githubWorkflowContext: {
+                  repository: $repository,
+                  runId: $run_id,
+                  runAttempt: $run_attempt,
+                  commitSha: $sha,
+                  gitRef: $ref,
+                  eventName: $event_name,
+                  prNumber: (if $pr_num == "" then null else $pr_num | tonumber? // $pr_num end),
+                  workflowRunUrl: $workflow_run_url,
+                  triggeredBy: $actor
+                }
+              }')
+          else
+            # File is not empty, attempt to parse its content as JSON and merge
+            # The first argument to jq (the filter string) will operate on the JSON from $TEST_RESULTS_FILE
+            enriched_payload=$(jq \
+              --arg repository "$GH_REPOSITORY" \
+              --arg run_id "$GH_RUN_ID" \
+              --arg run_attempt "$GH_RUN_ATTEMPT" \
+              --arg sha "$GH_SHA" \
+              --arg ref "$GH_REF" \
+              --arg event_name "$GH_EVENT_NAME" \
+              --arg pr_num "$pr_number_to_send" \
+              --arg workflow_run_url "$GH_WORKFLOW_RUN_URL" \
+              --arg actor "$GH_ACTOR" \
+              '. + {
+                githubWorkflowContext: {
+                  repository: $repository,
+                  runId: $run_id,
+                  runAttempt: $run_attempt,
+                  commitSha: $sha,
+                  gitRef: $ref,
+                  eventName: $event_name,
+                  prNumber: (if $pr_num == "" then null else $pr_num | tonumber? // $pr_num end),
+                  workflowRunUrl: $workflow_run_url,
+                  triggeredBy: $actor
+                }
+              }' "$TEST_RESULTS_FILE") # Pass the file path directly to jq
+          fi
+
+          # Check if jq command failed (e.g., due to invalid JSON in $TEST_RESULTS_FILE)
+          # jq exits with a non-zero status if it errors (e.g. parse error)
+          jq_exit_code=$?
+          if [ $jq_exit_code -ne 0 ] || [ -z "$enriched_payload" ]; then
+            echo "::error::Failed to process JSON with jq (exit code: $jq_exit_code). Input file: $TEST_RESULTS_FILE"
+            if [ -s "$TEST_RESULTS_FILE" ]; then # Check if file has content before trying to cat
+              echo "Contents of $TEST_RESULTS_FILE that may have caused an error:"
+              cat "$TEST_RESULTS_FILE"
+            elif [ -f "$TEST_RESULTS_FILE" ]; then
+              echo "$TEST_RESULTS_FILE exists but is empty."
+            fi
+            exit 1 # Fail the step
+          fi
+
+          # (Rest of the script: echo "Enriched payload:", curl command, etc.)
+          # For debugging, you can print the payload (remove in production if sensitive)
+          echo "Enriched payload to send:"
+          echo "$enriched_payload"
+
+          echo "Sending data to webhook: $WEBHOOK_URL"
+
+          http_response_code=$(curl -s -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Event: $GH_EVENT_NAME" \
+            -H "X-GitHub-Run-Id: $GH_RUN_ID" \
+            --data "$enriched_payload" \
+            "$WEBHOOK_URL" \
+            -o curl_response_body.txt 2>curl_stderr.txt)
+
+          curl_stderr_content=$(cat curl_stderr.txt)
+          if [ -n "$curl_stderr_content" ]; then
+            echo "::warning::curl stderr: $curl_stderr_content"
+          fi
+
+          echo "Webhook response code: $http_response_code"
+          echo "Webhook response body:"
+          cat curl_response_body.txt
+
+
+          if [[ "$http_response_code" -ge 200 && "$http_response_code" -lt 300 ]]; then
+            echo "Successfully sent data to webhook."
+          else
+            echo "::error::Webhook call failed with status code $http_response_code."
+            # Optionally, fail the step if the webhook call is critical
+            # exit 1
+          fi
